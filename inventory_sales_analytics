@@ -1,0 +1,499 @@
+import sqlite3
+import random
+from pathlib import Path
+from datetime import date, datetime, timedelta
+import io
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+APP_DIR = Path(__file__).parent
+DB_PATH = APP_DIR / "inventory.db"
+
+st.set_page_config(page_title="RetailIQ | Inventory & Sales", page_icon="📦", layout="wide")
+
+# ---------- Database ----------
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def init_db():
+    with get_conn() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            supplier TEXT DEFAULT '',
+            cost_price REAL NOT NULL CHECK(cost_price >= 0),
+            selling_price REAL NOT NULL CHECK(selling_price >= 0),
+            stock_qty INTEGER NOT NULL DEFAULT 0 CHECK(stock_qty >= 0),
+            reorder_level INTEGER NOT NULL DEFAULT 5 CHECK(reorder_level >= 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_no TEXT NOT NULL UNIQUE,
+            product_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            unit_price REAL NOT NULL CHECK(unit_price >= 0),
+            unit_cost REAL NOT NULL CHECK(unit_cost >= 0),
+            discount REAL NOT NULL DEFAULT 0 CHECK(discount >= 0),
+            sale_date TEXT NOT NULL,
+            customer_name TEXT DEFAULT '',
+            payment_method TEXT DEFAULT 'UPI',
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        );
+        CREATE TABLE IF NOT EXISTS purchases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            purchase_no TEXT NOT NULL UNIQUE,
+            product_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            unit_cost REAL NOT NULL CHECK(unit_cost >= 0),
+            purchase_date TEXT NOT NULL,
+            supplier TEXT DEFAULT '',
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        );
+        CREATE TABLE IF NOT EXISTS stock_movements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            movement_type TEXT NOT NULL CHECK(movement_type IN ('OPENING','SALE','PURCHASE','ADJUSTMENT')),
+            quantity_change INTEGER NOT NULL,
+            reference TEXT DEFAULT '',
+            movement_date TEXT NOT NULL,
+            notes TEXT DEFAULT '',
+            FOREIGN KEY(product_id) REFERENCES products(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sales_date ON sales(sale_date);
+        CREATE INDEX IF NOT EXISTS idx_purchases_date ON purchases(purchase_date);
+        """)
+        count = conn.execute("SELECT COUNT(*) FROM products").fetchone()[0]
+        if count == 0:
+            seed_demo_data(conn)
+
+def seed_demo_data(conn):
+    products = [
+        ("EL-1001","Wireless Mouse","Electronics","TechSource",420,699,24,8),
+        ("EL-1002","Mechanical Keyboard","Electronics","TechSource",1250,1899,7,8),
+        ("EL-1003","USB-C Cable","Electronics","ConnectHub",90,199,42,12),
+        ("EL-1004","Bluetooth Speaker","Electronics","SoundKart",780,1299,11,5),
+        ("ST-2001","Notebook A5","Stationery","PaperPoint",28,49,80,20),
+        ("ST-2002","Gel Pen Pack","Stationery","PaperPoint",55,99,16,15),
+        ("ST-2003","Desk Organizer","Stationery","OfficeNest",140,249,9,8),
+        ("HM-3001","Steel Water Bottle","Home & Living","DailyNeeds",180,349,20,8),
+        ("HM-3002","LED Desk Lamp","Home & Living","BrightHouse",390,699,5,6),
+        ("CL-4001","Cotton T-Shirt","Clothing","UrbanWear",220,449,18,10),
+        ("CL-4002","Canvas Tote Bag","Clothing","UrbanWear",110,249,31,10),
+        ("GR-5001","Reusable Grocery Bag","Groceries","DailyNeeds",22,59,65,20),
+    ]
+    for p in products:
+        cur = conn.execute("""INSERT INTO products
+            (sku,name,category,supplier,cost_price,selling_price,stock_qty,reorder_level)
+            VALUES (?,?,?,?,?,?,?,?)""", p)
+        conn.execute("""INSERT INTO stock_movements
+            (product_id,movement_type,quantity_change,reference,movement_date,notes)
+            VALUES (?,'OPENING',?,?,?,?)""",
+            (cur.lastrowid, p[6], "OPENING-STOCK", date.today().isoformat(), "Demo opening stock"))
+
+    # Create realistic demo sales for the previous 90 days.
+    random.seed(42)
+    product_ids = [r[0] for r in conn.execute("SELECT id FROM products").fetchall()]
+    product_map = {r["id"]: r for r in conn.execute("SELECT * FROM products").fetchall()}
+    for i in range(95):
+        pid = random.choice(product_ids)
+        p = product_map[pid]
+        qty = random.randint(1, 4)
+        sold_on = date.today() - timedelta(days=random.randint(0, 89))
+        discount = random.choice([0, 0, 0, 10, 20])
+        invoice = f"DEMO-{sold_on.strftime('%y%m%d')}-{i+1:04d}"
+        # Demo sales may represent earlier stock movement; don't change current stock again.
+        conn.execute("""INSERT INTO sales
+            (invoice_no,product_id,quantity,unit_price,unit_cost,discount,sale_date,customer_name,payment_method)
+            VALUES (?,?,?,?,?,?,?,?,?)""",
+            (invoice, pid, qty, p["selling_price"], p["cost_price"], discount, sold_on.isoformat(),
+             random.choice(["Walk-in Customer","Aarav Shah","Sara Khan","Rohan Patil","Online Order"]),
+             random.choice(["UPI","Cash","Card"])))
+
+init_db()
+
+def query_df(sql, params=()):
+    with get_conn() as conn:
+        return pd.read_sql_query(sql, conn, params=params)
+
+def money(value):
+    return f"₹{float(value or 0):,.2f}"
+
+def next_ref(prefix):
+    return f"{prefix}-{datetime.now().strftime('%y%m%d%H%M%S')}"
+
+def load_products(active_only=False):
+    return query_df("SELECT * FROM products ORDER BY name")
+
+# ---------- Sidebar ----------
+st.sidebar.title("📦 RetailIQ")
+st.sidebar.caption("Inventory & Sales Analytics")
+page = st.sidebar.radio("Navigation", [
+    "Dashboard", "Products & Stock", "Record a Sale", "Record a Purchase",
+    "Sales History", "Purchase History", "Reports & Export", "Settings"
+])
+st.sidebar.divider()
+st.sidebar.caption("Local demo • SQLite database")
+if st.sidebar.button("Reset demo database", help="Deletes local changes and recreates demo data."):
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+    init_db()
+    st.sidebar.success("Demo database reset.")
+    st.rerun()
+
+# ---------- Dashboard ----------
+if page == "Dashboard":
+    st.title("Retail performance dashboard")
+    st.caption("A live view of sales, gross profit, inventory health and product performance.")
+    today = date.today()
+    start_default = today - timedelta(days=29)
+    c1, c2, c3 = st.columns([1,1,2])
+    start_date = c1.date_input("From", value=start_default)
+    end_date = c2.date_input("To", value=today)
+    category_options = ["All categories"] + sorted(load_products()["category"].dropna().unique().tolist())
+    category = c3.selectbox("Category", category_options)
+    if start_date > end_date:
+        st.error("The start date must be on or before the end date.")
+        st.stop()
+
+    sales_sql = """
+        SELECT s.*, p.name AS product_name, p.category
+        FROM sales s JOIN products p ON p.id=s.product_id
+        WHERE s.sale_date BETWEEN ? AND ?
+    """
+    params = [start_date.isoformat(), end_date.isoformat()]
+    if category != "All categories":
+        sales_sql += " AND p.category = ?"
+        params.append(category)
+    sales = query_df(sales_sql, params)
+    products = load_products()
+    inventory_value = float((products["stock_qty"] * products["cost_price"]).sum()) if not products.empty else 0
+    inventory_retail = float((products["stock_qty"] * products["selling_price"]).sum()) if not products.empty else 0
+    low_stock = products[products["stock_qty"] <= products["reorder_level"]]
+    if not sales.empty:
+        sales["gross_sales"] = sales["quantity"] * sales["unit_price"]
+        sales["net_sales"] = sales["gross_sales"] - sales["discount"]
+        sales["gross_profit"] = sales["net_sales"] - (sales["quantity"] * sales["unit_cost"])
+        revenue = sales["net_sales"].sum()
+        gross_profit = sales["gross_profit"].sum()
+        units_sold = int(sales["quantity"].sum())
+        order_count = sales["invoice_no"].nunique()
+        margin = gross_profit / revenue * 100 if revenue else 0
+    else:
+        revenue = gross_profit = units_sold = order_count = margin = 0
+
+    k = st.columns(5)
+    k[0].metric("Net sales", money(revenue))
+    k[1].metric("Gross profit", money(gross_profit))
+    k[2].metric("Gross margin", f"{margin:.1f}%")
+    k[3].metric("Units sold", f"{units_sold:,}")
+    k[4].metric("Inventory at cost", money(inventory_value))
+    st.divider()
+
+    left, right = st.columns([1.45, 1])
+    with left:
+        st.subheader("Sales over time")
+        if not sales.empty:
+            trend = sales.copy()
+            trend["sale_date"] = pd.to_datetime(trend["sale_date"])
+            trend = trend.groupby(trend["sale_date"].dt.to_period("D").astype(str), as_index=False)["net_sales"].sum()
+            trend.columns = ["Date", "Net sales"]
+            fig = px.line(trend, x="Date", y="Net sales", markers=True, template="plotly_white")
+            fig.update_layout(margin=dict(l=10,r=10,t=20,b=10), height=320)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No sales in the selected period.")
+    with right:
+        st.subheader("Sales by category")
+        if not sales.empty:
+            cat = sales.groupby("category", as_index=False)["net_sales"].sum().sort_values("net_sales", ascending=False)
+            fig = px.pie(cat, names="category", values="net_sales", hole=0.55, template="plotly_white")
+            fig.update_layout(margin=dict(l=5,r=5,t=20,b=5), height=320, legend_title="")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Category chart will appear when sales exist.")
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("Top products by revenue")
+        if not sales.empty:
+            top = sales.groupby("product_name", as_index=False)["net_sales"].sum().sort_values("net_sales", ascending=False).head(8)
+            fig = px.bar(top, x="net_sales", y="product_name", orientation="h", template="plotly_white",
+                         labels={"net_sales":"Net sales","product_name":"Product"})
+            fig.update_layout(yaxis={"categoryorder":"total ascending"}, margin=dict(l=5,r=5,t=15,b=5), height=320)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No product sales to chart.")
+    with right:
+        st.subheader(f"Stock alerts ({len(low_stock)})")
+        if low_stock.empty:
+            st.success("No products are at or below their reorder level.")
+        else:
+            display = low_stock[["sku","name","category","stock_qty","reorder_level"]].rename(columns={
+                "sku":"SKU","name":"Product","category":"Category","stock_qty":"In stock","reorder_level":"Reorder at"})
+            st.dataframe(display, use_container_width=True, hide_index=True)
+    st.caption(f"Orders in period: {order_count:,} • Inventory retail value: {money(inventory_retail)} • Figures are calculated from recorded transactions.")
+
+# ---------- Products ----------
+elif page == "Products & Stock":
+    st.title("Products & stock")
+    st.caption("Create products, edit pricing and stock thresholds, or make a controlled stock adjustment.")
+    tab1, tab2, tab3 = st.tabs(["Product catalogue", "Add product", "Stock adjustment"])
+    with tab1:
+        products = load_products()
+        search = st.text_input("Search by SKU, product, category or supplier")
+        if search:
+            mask = products.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
+            products = products[mask]
+        st.dataframe(products[["id","sku","name","category","supplier","cost_price","selling_price","stock_qty","reorder_level"]]
+                     .rename(columns={"id":"ID","sku":"SKU","name":"Product","category":"Category","supplier":"Supplier",
+                                      "cost_price":"Cost ₹","selling_price":"Price ₹","stock_qty":"Stock","reorder_level":"Reorder level"}),
+                     use_container_width=True, hide_index=True)
+        st.markdown("#### Edit a product")
+        all_products = load_products()
+        if not all_products.empty:
+            chosen_id = st.selectbox("Product", all_products["id"], format_func=lambda x: f'{all_products.loc[all_products.id==x, "sku"].iloc[0]} — {all_products.loc[all_products.id==x, "name"].iloc[0]}')
+            p = all_products[all_products.id == chosen_id].iloc[0]
+            with st.form("edit_product"):
+                name = st.text_input("Product name", p["name"])
+                cat = st.text_input("Category", p["category"])
+                supplier = st.text_input("Supplier", p["supplier"] or "")
+                cost = st.number_input("Unit cost (₹)", min_value=0.0, value=float(p["cost_price"]), step=1.0)
+                price = st.number_input("Selling price (₹)", min_value=0.0, value=float(p["selling_price"]), step=1.0)
+                reorder = st.number_input("Reorder level", min_value=0, value=int(p["reorder_level"]), step=1)
+                submitted = st.form_submit_button("Save product changes", type="primary")
+                if submitted:
+                    if not name.strip() or not cat.strip():
+                        st.error("Product name and category are required.")
+                    else:
+                        with get_conn() as conn:
+                            conn.execute("UPDATE products SET name=?,category=?,supplier=?,cost_price=?,selling_price=?,reorder_level=? WHERE id=?",
+                                         (name.strip(),cat.strip(),supplier.strip(),cost,price,reorder,int(chosen_id)))
+                        st.success("Product updated.")
+                        st.rerun()
+    with tab2:
+        with st.form("add_product", clear_on_submit=True):
+            a,b = st.columns(2)
+            sku = a.text_input("SKU / product code", placeholder="e.g. EL-1005")
+            name = b.text_input("Product name")
+            cat = a.selectbox("Category", ["Electronics","Stationery","Home & Living","Clothing","Groceries","Other"])
+            supplier = b.text_input("Supplier")
+            cost = a.number_input("Unit cost (₹)", min_value=0.0, value=100.0, step=10.0)
+            price = b.number_input("Selling price (₹)", min_value=0.0, value=150.0, step=10.0)
+            stock = a.number_input("Opening stock", min_value=0, value=0, step=1)
+            reorder = b.number_input("Reorder level", min_value=0, value=5, step=1)
+            ok = st.form_submit_button("Add product", type="primary")
+            if ok:
+                if not sku.strip() or not name.strip():
+                    st.error("SKU and product name are required.")
+                else:
+                    try:
+                        with get_conn() as conn:
+                            cur = conn.execute("""INSERT INTO products(sku,name,category,supplier,cost_price,selling_price,stock_qty,reorder_level)
+                                                  VALUES(?,?,?,?,?,?,?,?)""",
+                                               (sku.strip().upper(),name.strip(),cat,supplier.strip(),cost,price,int(stock),int(reorder)))
+                            if stock:
+                                conn.execute("""INSERT INTO stock_movements(product_id,movement_type,quantity_change,reference,movement_date,notes)
+                                                VALUES(?,'OPENING',?,?,?,?)""",
+                                             (cur.lastrowid,int(stock),"OPENING-STOCK",date.today().isoformat(),"Opening stock at product creation"))
+                        st.success(f"Product {sku.upper()} added.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("That SKU already exists. Choose a unique SKU.")
+    with tab3:
+        products = load_products()
+        if products.empty:
+            st.info("Add a product first.")
+        else:
+            with st.form("adjust_stock"):
+                pid = st.selectbox("Product", products["id"], format_func=lambda x: f'{products.loc[products.id==x,"sku"].iloc[0]} — {products.loc[products.id==x,"name"].iloc[0]}')
+                direction = st.radio("Adjustment", ["Add stock","Remove stock"], horizontal=True)
+                qty = st.number_input("Quantity", min_value=1, value=1, step=1)
+                note = st.text_input("Reason", placeholder="e.g. stock count correction, damaged goods")
+                ok = st.form_submit_button("Apply adjustment", type="primary")
+                if ok:
+                    with get_conn() as conn:
+                        current = conn.execute("SELECT stock_qty FROM products WHERE id=?",(int(pid),)).fetchone()["stock_qty"]
+                        new_qty = current + int(qty) if direction=="Add stock" else current - int(qty)
+                        if new_qty < 0:
+                            st.error("Adjustment would make stock negative.")
+                        else:
+                            change = int(qty) if direction=="Add stock" else -int(qty)
+                            conn.execute("UPDATE products SET stock_qty=? WHERE id=?",(new_qty,int(pid)))
+                            conn.execute("""INSERT INTO stock_movements(product_id,movement_type,quantity_change,reference,movement_date,notes)
+                                            VALUES(?,'ADJUSTMENT',?,?,?,?)""",
+                                         (int(pid),change,"MANUAL-ADJUSTMENT",date.today().isoformat(),note.strip()))
+                            st.success(f"Stock updated to {new_qty}.")
+                            st.rerun()
+
+# ---------- Record sale ----------
+elif page == "Record a Sale":
+    st.title("Record a sale")
+    st.caption("Recording a sale creates an invoice and deducts stock in a single database transaction.")
+    products = load_products()
+    if products.empty:
+        st.warning("Add products before recording sales.")
+    else:
+        available = products[products["stock_qty"] > 0]
+        if available.empty:
+            st.warning("There is no stock available to sell.")
+        else:
+            with st.form("sale_form"):
+                pid = st.selectbox("Product", available["id"], format_func=lambda x: f'{available.loc[available.id==x,"name"].iloc[0]} — {int(available.loc[available.id==x,"stock_qty"].iloc[0])} in stock')
+                p = available[available.id==pid].iloc[0]
+                c1,c2,c3 = st.columns(3)
+                qty = c1.number_input("Quantity", min_value=1, max_value=int(p["stock_qty"]), value=1, step=1)
+                unit_price = c2.number_input("Selling price per unit (₹)", min_value=0.0, value=float(p["selling_price"]), step=1.0)
+                discount = c3.number_input("Total discount (₹)", min_value=0.0, value=0.0, step=10.0)
+                sale_date = st.date_input("Sale date", value=date.today())
+                customer = st.text_input("Customer name", value="Walk-in Customer")
+                payment = st.selectbox("Payment method", ["UPI","Cash","Card","Bank transfer","Other"])
+                total = int(qty)*unit_price-discount
+                st.info(f"Invoice total: **{money(total)}**  ·  Estimated gross profit: **{money(total-int(qty)*float(p['cost_price']))}**")
+                ok = st.form_submit_button("Save sale & update stock", type="primary")
+                if ok:
+                    if discount > int(qty)*unit_price:
+                        st.error("Discount cannot exceed the sale value.")
+                    else:
+                        invoice = next_ref("INV")
+                        try:
+                            with get_conn() as conn:
+                                current = conn.execute("SELECT stock_qty FROM products WHERE id=?",(int(pid),)).fetchone()["stock_qty"]
+                                if int(qty) > current:
+                                    st.error("Not enough stock available.")
+                                else:
+                                    conn.execute("""INSERT INTO sales(invoice_no,product_id,quantity,unit_price,unit_cost,discount,sale_date,customer_name,payment_method)
+                                                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                                                 (invoice,int(pid),int(qty),unit_price,float(p["cost_price"]),discount,sale_date.isoformat(),customer.strip(),payment))
+                                    conn.execute("UPDATE products SET stock_qty=stock_qty-? WHERE id=?",(int(qty),int(pid)))
+                                    conn.execute("""INSERT INTO stock_movements(product_id,movement_type,quantity_change,reference,movement_date,notes)
+                                                    VALUES(?,'SALE',?,?,?,?)""",
+                                                 (int(pid),-int(qty),invoice,sale_date.isoformat(),"Sale recorded"))
+                            st.success(f"Sale saved. Invoice: {invoice}")
+                            st.rerun()
+                        except sqlite3.IntegrityError as e:
+                            st.error(f"Could not save sale: {e}")
+
+# ---------- Record purchase ----------
+elif page == "Record a Purchase":
+    st.title("Record a purchase / restock")
+    st.caption("Record stock received from a supplier and update inventory.")
+    products = load_products()
+    if products.empty:
+        st.warning("Add products before recording purchases.")
+    else:
+        with st.form("purchase_form"):
+            pid = st.selectbox("Product", products["id"], format_func=lambda x: f'{products.loc[products.id==x,"name"].iloc[0]} — SKU {products.loc[products.id==x,"sku"].iloc[0]}')
+            p = products[products.id==pid].iloc[0]
+            c1,c2 = st.columns(2)
+            qty = c1.number_input("Quantity received", min_value=1, value=10, step=1)
+            cost = c2.number_input("Unit purchase cost (₹)", min_value=0.0, value=float(p["cost_price"]), step=1.0)
+            purchase_date = st.date_input("Purchase date", value=date.today())
+            supplier = st.text_input("Supplier", value=str(p["supplier"] or ""))
+            ok = st.form_submit_button("Save purchase & add stock", type="primary")
+            if ok:
+                ref = next_ref("PO")
+                with get_conn() as conn:
+                    conn.execute("""INSERT INTO purchases(purchase_no,product_id,quantity,unit_cost,purchase_date,supplier)
+                                    VALUES(?,?,?,?,?,?)""",
+                                 (ref,int(pid),int(qty),cost,purchase_date.isoformat(),supplier.strip()))
+                    conn.execute("UPDATE products SET stock_qty=stock_qty+? WHERE id=?",(int(qty),int(pid)))
+                    conn.execute("UPDATE products SET cost_price=? WHERE id=?",(cost,int(pid)))
+                    conn.execute("""INSERT INTO stock_movements(product_id,movement_type,quantity_change,reference,movement_date,notes)
+                                    VALUES(?,'PURCHASE',?,?,?,?)""",
+                                 (int(pid),int(qty),ref,purchase_date.isoformat(),"Purchase/restock recorded"))
+                st.success(f"Purchase saved: {ref}")
+                st.rerun()
+
+# ---------- Sales history ----------
+elif page == "Sales History":
+    st.title("Sales history")
+    c1,c2 = st.columns(2)
+    start = c1.date_input("From date", date.today()-timedelta(days=89), key="sales_from")
+    end = c2.date_input("To date", date.today(), key="sales_to")
+    df = query_df("""SELECT s.invoice_no,s.sale_date,p.sku,p.name AS product,s.quantity,s.unit_price,s.discount,
+                            (s.quantity*s.unit_price-s.discount) AS net_sales,
+                            (s.quantity*s.unit_price-s.discount-s.quantity*s.unit_cost) AS gross_profit,
+                            s.customer_name,s.payment_method
+                     FROM sales s JOIN products p ON p.id=s.product_id
+                     WHERE s.sale_date BETWEEN ? AND ? ORDER BY s.sale_date DESC,s.id DESC""",
+                  (start.isoformat(),end.isoformat()))
+    st.metric("Net sales in selected period", money(df["net_sales"].sum() if not df.empty else 0))
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    if not df.empty:
+        st.download_button("Download sales CSV", df.to_csv(index=False).encode("utf-8-sig"), "sales_history.csv", "text/csv")
+
+# ---------- Purchase history ----------
+elif page == "Purchase History":
+    st.title("Purchase history")
+    df = query_df("""SELECT pu.purchase_no,pu.purchase_date,p.sku,p.name AS product,pu.quantity,pu.unit_cost,
+                            pu.quantity*pu.unit_cost AS purchase_total,pu.supplier
+                     FROM purchases pu JOIN products p ON p.id=pu.product_id ORDER BY pu.purchase_date DESC,pu.id DESC""")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    if not df.empty:
+        st.download_button("Download purchases CSV", df.to_csv(index=False).encode("utf-8-sig"), "purchase_history.csv", "text/csv")
+
+# ---------- Reports ----------
+elif page == "Reports & Export":
+    st.title("Reports & export")
+    st.caption("Download clean datasets for Excel, Power BI, or further analysis.")
+    products = query_df("SELECT sku,name,category,supplier,cost_price,selling_price,stock_qty,reorder_level FROM products ORDER BY name")
+    sales = query_df("""SELECT s.invoice_no,s.sale_date,p.sku,p.name AS product,p.category,s.quantity,s.unit_price,s.unit_cost,s.discount,
+                        (s.quantity*s.unit_price-s.discount) AS net_sales,
+                        (s.quantity*s.unit_price-s.discount-s.quantity*s.unit_cost) AS gross_profit,
+                        s.customer_name,s.payment_method
+                        FROM sales s JOIN products p ON p.id=s.product_id ORDER BY s.sale_date DESC""")
+    purchases = query_df("""SELECT pu.purchase_no,pu.purchase_date,p.sku,p.name AS product,pu.quantity,pu.unit_cost,
+                            pu.quantity*pu.unit_cost AS purchase_total,pu.supplier
+                            FROM purchases pu JOIN products p ON p.id=pu.product_id ORDER BY pu.purchase_date DESC""")
+    c1,c2,c3 = st.columns(3)
+    c1.download_button("Export products CSV", products.to_csv(index=False).encode("utf-8-sig"), "products.csv", "text/csv", use_container_width=True)
+    c2.download_button("Export sales CSV", sales.to_csv(index=False).encode("utf-8-sig"), "sales.csv", "text/csv", use_container_width=True)
+    c3.download_button("Export purchases CSV", purchases.to_csv(index=False).encode("utf-8-sig"), "purchases.csv", "text/csv", use_container_width=True)
+    st.divider()
+    st.subheader("Restock recommendations")
+    if sales.empty:
+        st.info("Record sales to generate demand-based recommendations.")
+    else:
+        recent_start = (date.today()-timedelta(days=30)).isoformat()
+        recent = query_df("""SELECT product_id,SUM(quantity) AS units_sold FROM sales WHERE sale_date>=? GROUP BY product_id""",(recent_start,))
+        merged = query_df("SELECT id,sku,name,category,stock_qty,reorder_level FROM products")
+        merged = merged.merge(recent, left_on="id", right_on="product_id", how="left").drop(columns=["product_id"])
+        merged["units_sold"] = merged["units_sold"].fillna(0).astype(int)
+        merged["avg_daily_demand"] = (merged["units_sold"]/30).round(2)
+        merged["estimated_days_left"] = merged.apply(lambda r: round(r["stock_qty"]/r["avg_daily_demand"],1) if r["avg_daily_demand"]>0 else None, axis=1)
+        merged["suggested_reorder_qty"] = merged.apply(lambda r: max(0, int(round(r["avg_daily_demand"]*30-r["stock_qty"]))) if r["avg_daily_demand"]>0 else max(0,int(r["reorder_level"]-r["stock_qty"])), axis=1)
+        merged["recommendation"] = merged.apply(lambda r: "Restock soon" if r["stock_qty"]<=r["reorder_level"] or (r["estimated_days_left"] is not None and r["estimated_days_left"]<10) else "Stock OK",axis=1)
+        st.dataframe(merged[["sku","name","category","stock_qty","units_sold","avg_daily_demand","estimated_days_left","suggested_reorder_qty","recommendation"]]
+                     .sort_values(["recommendation","estimated_days_left"], ascending=[True,True]), use_container_width=True, hide_index=True)
+        st.caption("Recommendation is a simple heuristic based on the last 30 days; it is not a forecast guarantee.")
+
+# ---------- Settings ----------
+elif page == "Settings":
+    st.title("Settings & data management")
+    st.warning("This is a local demo application. The SQLite database is stored in the project folder. Back it up before moving or deleting files.")
+    with get_conn() as conn:
+        counts = {
+            "Products": conn.execute("SELECT COUNT(*) FROM products").fetchone()[0],
+            "Sales": conn.execute("SELECT COUNT(*) FROM sales").fetchone()[0],
+            "Purchases": conn.execute("SELECT COUNT(*) FROM purchases").fetchone()[0],
+            "Stock movements": conn.execute("SELECT COUNT(*) FROM stock_movements").fetchone()[0],
+        }
+    c = st.columns(4)
+    for col, (label, val) in zip(c, counts.items()):
+        col.metric(label, val)
+    st.subheader("Stock movement ledger")
+    movements = query_df("""SELECT sm.movement_date,p.sku,p.name,sm.movement_type,sm.quantity_change,sm.reference,sm.notes
+                            FROM stock_movements sm JOIN products p ON p.id=sm.product_id
+                            ORDER BY sm.movement_date DESC,sm.id DESC LIMIT 500""")
+    st.dataframe(movements, use_container_width=True, hide_index=True)
+    st.download_button("Export stock ledger CSV", movements.to_csv(index=False).encode("utf-8-sig"), "stock_movements.csv", "text/csv")
+    st.caption("For production use, add authentication, role-based access, backups, audit controls, tax handling, and concurrency testing.")
