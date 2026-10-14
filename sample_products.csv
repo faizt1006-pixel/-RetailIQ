@@ -1,0 +1,13 @@
+sku,name,category,supplier,cost_price,selling_price,stock_qty,reorder_level
+EL-1001,Wireless Mouse,Electronics,TechSource,420,699,24,8
+EL-1002,Mechanical Keyboard,Electronics,TechSource,1250,1899,7,8
+EL-1003,USB-C Cable,Electronics,ConnectHub,90,199,42,12
+EL-1004,Bluetooth Speaker,Electronics,SoundKart,780,1299,11,5
+ST-2001,Notebook A5,Stationery,PaperPoint,28,49,80,20
+ST-2002,Gel Pen Pack,Stationery,PaperPoint,55,99,16,15
+ST-2003,Desk Organizer,Stationery,OfficeNest,140,249,9,8
+HM-3001,Steel Water Bottle,Home & Living,DailyNeeds,180,349,20,8
+HM-3002,LED Desk Lamp,Home & Living,BrightHouse,390,699,5,6
+CL-4001,Cotton T-Shirt,Clothing,UrbanWear,220,449,18,10
+CL-4002,Canvas Tote Bag,Clothing,UrbanWear,110,249,31,10
+GR-5001,Reusable Grocery Bag,Groceries,DailyNeeds,22,59,65,20
